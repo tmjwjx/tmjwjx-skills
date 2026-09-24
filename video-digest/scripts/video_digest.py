@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -202,6 +203,83 @@ def resolve_bilibili(url, key, workdir, download):
     return info
 
 
+CHUNK_SECONDS = 300  # 实测 5min/900k/480p ≈ 29MB(base64 39MB) 可通过, 更大未验证
+
+
+def probe_duration(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "csv=p=0", path], capture_output=True, text=True)
+    try:
+        return float(r.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def encode_chunk(src, out, start, seconds):
+    def run(vcodec_args):
+        return subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-ss", str(start),
+                               "-t", str(seconds), "-i", src, *vcodec_args,
+                               "-b:v", "900k", "-vf", "scale=-2:480", "-pix_fmt", "yuv420p",
+                               "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart", out],
+                              capture_output=True, text=True)
+    r = run(["-c:v", "h264_videotoolbox"])  # 输出选项必须放在 -i 之后
+    if (r.returncode != 0 or not os.path.exists(out) or os.path.getsize(out) < 100_000):
+        r = run(["-c:v", "libx264", "-preset", "veryfast"])
+
+
+def analyze_long(cfg, local_file, title, workdir):
+    """长视频: 分 5 分钟块逐段提取(每段结果落盘缓存, 失败重试一次后跳过), 再合成最终笔记."""
+    dur = probe_duration(local_file)
+    n = max(1, int(dur // CHUNK_SECONDS) + (1 if dur % CHUNK_SECONDS else 0))
+    print(f"长视频 {fmt_ts(dur)}, 分 {n} 段逐段提取 ...", file=sys.stderr)
+    parts = []
+    for i in range(n):
+        start = i * CHUNK_SECONDS
+        chunk = os.path.join(workdir, f"chunk_{i:02d}.mp4")
+        chunk_md = os.path.join(workdir, f"chunk_{i:02d}.md")
+        if os.path.exists(chunk_md):  # 缓存命中, 跳过
+            seg = open(chunk_md, encoding="utf-8").read()
+            parts.append(f"### 第 {i + 1}/{n} 段({fmt_ts(start)} 起)\n{seg}")
+            print(f"  段 {i + 1}/{n} 缓存命中", file=sys.stderr)
+            continue
+        encode_chunk(local_file, chunk, start, CHUNK_SECONDS)
+        print(f"  段 {i + 1}/{n}({fmt_ts(start)} 起) 提取中 ...", file=sys.stderr)
+        seg, err = "", None
+        for attempt in (1, 2):  # 失败重试一次(限流/超时多为瞬时)
+            try:
+                seg = call_zhipu(cfg, [as_base64_part(chunk), {"type": "text", "text":
+                    f"这是视频《{title}》的第 {i + 1}/{n} 段(从 {fmt_ts(start)} 开始)。输出 markdown 中文:\n"
+                    "## 画面内容\n出现的文字/PPT/图表/演示, 逐条\n## 口播要点\n按顺序, 详细, 不省略"}])
+                break
+            except ZhipuError as e:
+                err = str(e)
+                print(f"    第 {attempt} 次失败: {err[:120]}", file=sys.stderr)
+                if attempt == 1:
+                    time.sleep(15)
+        if not seg:
+            seg = f">(本段提取失败: {err})"
+        with open(chunk_md, "w", encoding="utf-8") as f:
+            f.write(seg)
+        parts.append(f"### 第 {i + 1}/{n} 段({fmt_ts(start)} 起)\n{seg}")
+    print("合并各段成最终笔记 ...", file=sys.stderr)
+    merged = "\n\n".join(parts)
+    for attempt in (1, 2, 3):  # 合成是瞬时 500 高发点, 多试两次
+        try:
+            return call_zhipu(cfg, [{"type": "text", "text":
+                f"以下是视频《{title}》全长 {fmt_ts(dur)} 的分段提取结果。合并成最终笔记, 输出 markdown(中文, 去重但保留细节):\n"
+                "## 主题概述\n一句话\n## 画面内容\n逐段, 保留 PPT/图表细节\n## 口播要点\n按时间顺序完整覆盖\n"
+                "## 关键结论\n代码/命令/清单照抄\n## 标签\n3-6 个\n\n" + merged}])
+        except ZhipuError as e:
+            if attempt == 3:
+                raise
+            print(f"    合成第 {attempt} 次失败({str(e)[:80]}), 20s 后重试", file=sys.stderr)
+            time.sleep(20)
+
+
+class ZhipuError(Exception):
+    pass
+
+
 def call_zhipu(cfg, content_parts):
     """content_parts: 完整的多模态 content 数组."""
     body = {
@@ -217,13 +295,30 @@ def call_zhipu(cfg, content_parts):
         with urllib.request.urlopen(req, timeout=600) as r:
             resp = json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
-        die(5, f"智谱 API HTTP {e.code}: {e.read().decode()[:800]}")
+        raise ZhipuError(f"智谱 API HTTP {e.code}: {e.read().decode()[:800]}")
     except Exception as e:
-        die(5, f"智谱 API 请求失败: {e}")
+        raise ZhipuError(f"智谱 API 请求失败: {e}")
     try:
         return resp["choices"][0]["message"]["content"]
     except (KeyError, IndexError):
-        die(5, f"智谱响应结构异常: {json.dumps(resp, ensure_ascii=False)[:600]}")
+        raise ZhipuError(f"智谱响应结构异常: {json.dumps(resp, ensure_ascii=False)[:600]}")
+
+
+def reencode_safe(src):
+    """智谱解析不了部分容器(如 m4s 流拷贝的 1210 错误), 重编码为干净 H.264/aac + faststart."""
+    out = os.path.splitext(src)[0] + ".safe.mp4"
+    print("重编码安全容器(480p 硬件加速) ...", file=sys.stderr)
+    common = ["-b:v", "1200k", "-vf", "scale=-2:480", "-pix_fmt", "yuv420p",
+              "-c:a", "aac", "-b:a", "96k", "-movflags", "+faststart"]
+    r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src,
+                        "-c:v", "h264_videotoolbox", *common, out], capture_output=True, text=True)
+    if r.returncode != 0:  # 无硬件编码器(非 macOS)退 libx264
+        r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", src,
+                            "-c:v", "libx264", "-preset", "veryfast", *common, out],
+                           capture_output=True, text=True)
+    if r.returncode != 0:
+        die(4, f"重编码失败: {r.stderr[-300:]}")
+    return out
 
 
 def as_base64_part(path):
@@ -285,7 +380,7 @@ def caption_frames(cfg, frames, title):
             "对每张图输出一行, 格式严格为: 【mm:ss】画面标题|画面内容(出现的文字/PPT/图表要点)。不要输出其他内容。"})
         try:
             resp = call_zhipu(cfg, content)
-        except SystemExit:
+        except ZhipuError:
             resp = ""
         lines = [l.strip() for l in resp.splitlines() if l.strip().startswith("【")]
         used = set()
@@ -350,27 +445,40 @@ def main():
         curl_download(info["direct"], local_file)
     if not local_file:
         die(1, "没有可用的视频源(直链或本地文件)")
+    # workdir 固定到视频 id: 段提取缓存可跨重跑复用(分段提取是最大成本)
+    workdir = "/tmp/video-digest/" + re.sub(r"[^\w-]", "_", str(info["id"]))[:60] + "_work"
+    os.makedirs(workdir, exist_ok=True)
     size = os.path.getsize(local_file)
     if size > 100 * 1024 * 1024:
         print(f"警告: {size / 1024 / 1024:.0f}MB 偏大, 可能超模型限制", file=sys.stderr)
     if not cfg.get("ZHIPU_API_KEY"):
         die(2, f"缺少 ZHIPU_API_KEY, 写入 {SKILL_DIR}/.env 或设环境变量")
 
-    # 1) 整视频画面+语音提取(直链优先, 失败回退本地 base64)
+    # 1) 整视频画面+语音提取(直链优先, 失败回退本地 base64; 1210 容器错误自动重编码重试)
     prompt_text = EXTRACT_PROMPT + (f"\n用户额外要求: {extra}" if extra else "")
     model = cfg.get("ZHIPU_MODEL", "glm-5.3-flash")
-    if info.get("direct"):
-        print("调用智谱提取画面+语音(直链) ...", file=sys.stderr)
+    text_part = {"type": "text", "text": prompt_text}
+
+    def analyze():
+        if info.get("direct"):
+            try:
+                print("调用智谱提取画面+语音(直链) ...", file=sys.stderr)
+                return call_zhipu(cfg, [{"type": "video_url", "video_url": {"url": info["direct"]}}, text_part])
+            except ZhipuError as e:
+                print(f"直链方式失败({str(e)[:80]}), 回退本地 base64 ...", file=sys.stderr)
         try:
-            content = call_zhipu(cfg, [
-                {"type": "video_url", "video_url": {"url": info["direct"]}},
-                {"type": "text", "text": prompt_text}])
-        except SystemExit:
-            print("直链方式失败, 回退本地 base64 ...", file=sys.stderr)
-            content = call_zhipu(cfg, [as_base64_part(local_file), {"type": "text", "text": prompt_text}])
+            return call_zhipu(cfg, [as_base64_part(local_file), text_part])
+        except ZhipuError as e:
+            if "1210" in str(e):
+                safe = reencode_safe(local_file)
+                return call_zhipu(cfg, [as_base64_part(safe), text_part])
+            raise
+
+    dur = probe_duration(local_file)
+    if dur > CHUNK_SECONDS:  # 长视频直接走分块路线, 不浪费一次整片上传
+        content = analyze_long(cfg, local_file, info["title"], workdir)
     else:
-        print("调用智谱提取画面+语音(base64) ...", file=sys.stderr)
-        content = call_zhipu(cfg, [as_base64_part(local_file), {"type": "text", "text": prompt_text}])
+        content = analyze()
 
     # 2) 场景抽帧 + 逐帧配说明
     caps = []
