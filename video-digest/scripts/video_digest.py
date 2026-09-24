@@ -202,10 +202,11 @@ def resolve_bilibili(url, key, workdir, download):
     return info
 
 
-def call_zhipu(cfg, video_part, prompt):
+def call_zhipu(cfg, content_parts):
+    """content_parts: 完整的多模态 content 数组."""
     body = {
         "model": cfg.get("ZHIPU_MODEL", "glm-5.3-flash"),
-        "messages": [{"role": "user", "content": [video_part, {"type": "text", "text": prompt}]}],
+        "messages": [{"role": "user", "content": content_parts}],
     }
     req = urllib.request.Request(
         "https://open.bigmodel.cn/api/paas/v4/chat/completions",
@@ -230,13 +231,91 @@ def as_base64_part(path):
     return {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{b64}"}}
 
 
+def fmt_ts(sec):
+    return f"{int(sec // 60):02d}:{int(sec % 60):02d}"
+
+
+def extract_frames(video, outdir, max_frames=10):
+    """场景切换抽帧(PPT/画面切换类效果好); 场景太少(口播类)按 45s 间隔兜底.
+
+    返回 [(图片路径, 时间秒)], 超过 max_frames 时均匀截取.
+    """
+    import glob
+    pat = os.path.join(outdir, "frame_%03d.jpg")
+    r = subprocess.run(["ffmpeg", "-y", "-loglevel", "info", "-i", video,
+                        "-vf", "select='gt(scene,0.2)',showinfo", "-vsync", "vfr",
+                        "-frames:v", "60", pat], capture_output=True, text=True)
+    times = [float(x) for x in re.findall(r"pts_time:([\d.]+)", r.stderr)]
+    frames = [(pat % (i + 1), t) for i, t in enumerate(times) if os.path.exists(pat % (i + 1))]
+    if len(frames) < 3:
+        for f in glob.glob(pat.replace("%03d", "*")):
+            os.unlink(f)
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", video,
+                        "-vf", "fps=1/45", "-frames:v", "60", pat],
+                       capture_output=True, text=True)
+        files = sorted(glob.glob(pat.replace("%03d", "*")))
+        frames = [(f, i * 45.0) for i, f in enumerate(files)]
+    frames = [(p, t) for p, t in frames if os.path.getsize(p) >= 8_000]  # 过滤转场/黑屏小帧
+    if len(frames) > max_frames:
+        span = frames[-1][1] - frames[0][1]
+        gap = max(30.0, span / max_frames)  # 最小间隔, 避免同一屏连拍
+        picked, last = [], -1e9
+        for p, t in frames:
+            if t - last >= gap:
+                picked.append((p, t))
+                last = t
+            if len(picked) >= max_frames:
+                break
+        frames = picked if len(picked) >= 3 else frames[:max_frames]
+    return frames
+
+
+def caption_frames(cfg, frames, title):
+    """批量(5张/次)让模型给每帧写『【时间】标题|要点』, 解析失败时整批原文兜底."""
+    caps, leftover = [], []
+    for i in range(0, len(frames), 5):
+        batch = frames[i:i + 5]
+        content = []
+        for p, _ in batch:
+            b64 = base64.b64encode(open(p, "rb").read()).decode()
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
+        ts = " ".join(f"{j + 1}){fmt_ts(t)}" for j, (_, t) in enumerate(batch))
+        content.append({"type": "text", "text":
+            f"这是视频《{title}》按时间顺序的截图, 对应时间点: {ts}。"
+            "对每张图输出一行, 格式严格为: 【mm:ss】画面标题|画面内容(出现的文字/PPT/图表要点)。不要输出其他内容。"})
+        try:
+            resp = call_zhipu(cfg, content)
+        except SystemExit:
+            resp = ""
+        lines = [l.strip() for l in resp.splitlines() if l.strip().startswith("【")]
+        used = set()
+        for p, t in batch:
+            line = next((l for l in lines if fmt_ts(t) in l and lines.index(l) not in used), "")
+            if line:
+                used.add(lines.index(line))
+            caps.append((p, t, line))
+    return caps
+
+
 def main():
-    args = [a for a in sys.argv[1:] if a != "--out"]
-    out_path = sys.argv[sys.argv.index("--out") + 1] if "--out" in sys.argv else None
-    parse_only = "--parse-only" in args
-    args = [a for a in args if a != "--parse-only"]
+    argv = sys.argv[1:]
+    out_path = argv[argv.index("--out") + 1] if "--out" in argv else None
+    max_frames = int(argv[argv.index("--frames") + 1]) if "--frames" in argv else 10
+    parse_only = "--parse-only" in argv
+    no_frames = "--no-frames" in argv
+    args, skip = [], False
+    for a in argv:  # 摘掉带值的选项, 剩下: 链接 + 可选的附加要求
+        if skip:
+            skip = False
+            continue
+        if a in ("--out", "--frames"):
+            skip = True
+            continue
+        if a in ("--parse-only", "--no-frames"):
+            continue
+        args.append(a)
     if not args:
-        die(1, "用法: video_digest.py <链接/分享文本/BV号> [附加要求] [--parse-only] [--out 文件]")
+        die(1, "用法: video_digest.py <链接/分享文本/BV号> [附加要求] [--frames 10] [--no-frames] [--parse-only] [--out 文件]")
     url, extra = args[0], " ".join(args[1:])
     cfg = load_env()
     if not cfg.get("TIKHUB_API_KEY"):
@@ -263,40 +342,67 @@ def main():
         if local_file:
             print(f"已下载: {local_file} ({os.path.getsize(local_file) / 1e6:.1f} MB)", file=sys.stderr)
         return
-    if info.get("direct") and not local_file and "xiaohongshu" not in low:
-        print("直链交给智谱拉取(失败自动回退本机下载)...", file=sys.stderr)
-        video_part = {"type": "video_url", "video_url": {"url": info["direct"]}}
-    elif local_file:
-        size = os.path.getsize(local_file)
-        if size > 100 * 1024 * 1024:
-            print(f"警告: {size / 1024 / 1024:.0f}MB 偏大, 可能超模型限制", file=sys.stderr)
-        print("本地视频 base64 编码后调用智谱 ...", file=sys.stderr)
-        video_part = as_base64_part(local_file)
-    else:
-        die(1, "没有可用的视频源(直链或本地文件)")
 
+    # 全流程要生成配图笔记, 必须有本地视频(抽帧用), 没有就先下载
+    if not local_file and info.get("direct"):
+        local_file = os.path.join(workdir, "video.mp4")
+        print("下载视频(抽帧配图用) ...", file=sys.stderr)
+        curl_download(info["direct"], local_file)
+    if not local_file:
+        die(1, "没有可用的视频源(直链或本地文件)")
+    size = os.path.getsize(local_file)
+    if size > 100 * 1024 * 1024:
+        print(f"警告: {size / 1024 / 1024:.0f}MB 偏大, 可能超模型限制", file=sys.stderr)
     if not cfg.get("ZHIPU_API_KEY"):
         die(2, f"缺少 ZHIPU_API_KEY, 写入 {SKILL_DIR}/.env 或设环境变量")
-    prompt = EXTRACT_PROMPT + (f"\n用户额外要求: {extra}" if extra else "")
-    try:
-        content = call_zhipu(cfg, video_part, prompt)
-    except SystemExit:
-        if local_file:
-            raise
-        print("直链方式失败, 回退: curl 下载后 base64 ...", file=sys.stderr)
-        dl = os.path.join(workdir, "fallback.mp4")
-        curl_download(info["direct"], dl)
-        content = call_zhipu(cfg, as_base64_part(dl), prompt)
 
-    result = (f"# {info['title']}\n\n> 来源: {url}\n> 作者: {info.get('author', '')}\n"
-              f"> 提取模型: {cfg.get('ZHIPU_MODEL', 'glm-5.3-flash')}\n\n{content}\n")
+    # 1) 整视频画面+语音提取(直链优先, 失败回退本地 base64)
+    prompt_text = EXTRACT_PROMPT + (f"\n用户额外要求: {extra}" if extra else "")
+    model = cfg.get("ZHIPU_MODEL", "glm-5.3-flash")
+    if info.get("direct"):
+        print("调用智谱提取画面+语音(直链) ...", file=sys.stderr)
+        try:
+            content = call_zhipu(cfg, [
+                {"type": "video_url", "video_url": {"url": info["direct"]}},
+                {"type": "text", "text": prompt_text}])
+        except SystemExit:
+            print("直链方式失败, 回退本地 base64 ...", file=sys.stderr)
+            content = call_zhipu(cfg, [as_base64_part(local_file), {"type": "text", "text": prompt_text}])
+    else:
+        print("调用智谱提取画面+语音(base64) ...", file=sys.stderr)
+        content = call_zhipu(cfg, [as_base64_part(local_file), {"type": "text", "text": prompt_text}])
+
+    # 2) 场景抽帧 + 逐帧配说明
+    caps = []
+    if not no_frames:
+        frames_dir = os.path.join(workdir, "frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        print(f"场景抽帧(上限 {max_frames} 张) ...", file=sys.stderr)
+        frames = extract_frames(local_file, frames_dir, max_frames)
+        if frames:
+            print(f"抽出 {len(frames)} 帧, 生成配图说明 ...", file=sys.stderr)
+            caps = caption_frames(cfg, frames, info["title"])
+
+    # 3) 组装带配图的文档笔记
     if not out_path:
-        os.makedirs("/tmp/video-digest", exist_ok=True)
-        out_path = "/tmp/video-digest/" + re.sub(r"[^\w-]", "_", str(info["id"]))[:60] + ".md"
+        out_path = "/tmp/video-digest/" + re.sub(r"[^\w-]", "_", str(info["id"]))[:60]
+    frames_out = os.path.join(os.path.dirname(os.path.abspath(out_path)), "frames")
+    os.makedirs(frames_out, exist_ok=True)
+    for p, _, _ in caps:
+        subprocess.run(["cp", p, os.path.join(frames_out, os.path.basename(p))])
+
+    head = (f"# {info['title']}\n\n> 来源: {url}\n> 作者: {info.get('author', '')}\n"
+            f"> 提取: {model} · 配图 {len(caps)} 张\n\n## 内容提取\n\n{content}\n")
+    if caps:
+        items = []
+        for p, t, line in caps:
+            cap = line.strip() or f"【{fmt_ts(t)}】画面截图"
+            items.append(f"{cap}\n\n![画面 {fmt_ts(t)}](frames/{os.path.basename(p)})\n")
+        head += "\n## 画面截图\n\n" + "\n".join(items)
     with open(out_path, "w", encoding="utf-8") as f:
-        f.write(result)
-    print(result)
-    print(f"\n---\n已保存: {out_path}", file=sys.stderr)
+        f.write(head + "\n")
+    print(head)
+    print(f"\n---\n已保存: {out_path} (配图目录: {frames_out})", file=sys.stderr)
 
 
 if __name__ == "__main__":

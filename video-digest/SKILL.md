@@ -18,11 +18,20 @@ description: 提取抖音/B站等平台视频的完整内容(画面+语音),交�
 ## 用法
 
 ```bash
-python3 ~/.claude/skills/video-digest/scripts/video_digest.py "<视频链接或BV号>" [--out /tmp/out.md]
-python3 ~/.claude/skills/video-digest/scripts/video_digest.py "<链接>" --parse-only   # 只解析不调智谱
+python3 ~/.claude/skills/video-digest/scripts/video_digest.py "<视频链接或BV号>"
+python3 ~/.claude/skills/video-digest/scripts/video_digest.py "<链接>" --frames 15      # 配图上限(默认 10)
+python3 ~/.claude/skills/video-digest/scripts/video_digest.py "<链接>" --no-frames      # 不要配图
+python3 ~/.claude/skills/video-digest/scripts/video_digest.py "<链接>" --parse-only     # 只解析不调智谱
+python3 ~/.claude/skills/video-digest/scripts/video_digest.py "<链接>" "额外提取要求" --out /tmp/note.md
 ```
 
 抖音整段分享文本可直接传入(脚本自动抠链接)。
+
+## 产物(带配图的文档笔记)
+
+- `<输出>/note.md`:内容提取(主题/画面/口播/结论/标签)+ 画面截图区(每张带时间戳与说明)
+- `<输出>/frames/`:场景切换抽帧(过滤黑屏小帧、按最小间隔去连拍)
+- 图片用相对路径 `frames/xxx.jpg` 引用;入库知识库时把 frames 语义化改名挪进 `Attachments/` 并修链接
 
 - 输出:stdout 打印完整 markdown,同时默认存到 `/tmp/video-digest/<视频ID>.md`
 - 提取 prompt 已内置(主题概述/画面内容逐段梳理/口播要点/关键结论/标签);要自定义提取侧重点时,把要求追加为第二个参数即可
@@ -44,6 +53,7 @@ python3 ~/.claude/skills/video-digest/scripts/video_digest.py "<链接>" --parse
 - 本地文件超 100MB 会警告(可能超模型限制),仍会尝试
 - TikHub 返回结构偶有变动,脚本用深搜 key 的方式取值;取不到时打印原始 JSON 片段辅助排查
 - 直链(play_addr)带时效签名,拿到后尽快用,不要长期存储复用
+- 长视频(30 分钟+)本地文件较大,base64 传智谱可能超限——超 100MB 会警告;不行就让用户换短视频或等 OSS 直链方案
 
 ## 给 AI 的约定
 
